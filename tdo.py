@@ -238,8 +238,20 @@ class ApartmentPlanOCR:
             return "0"
 
         has_garderoba = present([r"\bgarderob\w*"])
-        has_kuchnia = present([r"\bkuchni\w*"])
-        has_aneks = present([r"\baneks\w*\s+kuchenn\w*"])
+        
+        # Logika dla kuchni vs aneksu - jeśli jest "salon z aneksem" to aneks=1, kuchnia=0
+        has_aneks_salon = bool(re.search(r"\bsalon\s+z\s+aneks\w*", text, re.IGNORECASE))
+        if has_aneks_salon:
+            has_kuchnia = "0"
+            has_aneks = "1"
+        else:
+            # Jeśli nie ma "salon z aneksem", sprawdź czy jest sama kuchnia lub aneks
+            has_aneks = present([r"\baneks\w*\s+kuchenn\w*"])
+            if has_aneks == "1":
+                has_kuchnia = "0"
+            else:
+                has_kuchnia = present([r"\bkuchni\w*"])
+        
         has_schowek = present([r"\bschow\w*"])
         has_spizarnia = present([r"\bspi(?:ż|z)arni\w*"])
         has_pom_gosp = present([r"\bpom\.?\s*gosp\.?\b", r"\bpomieszczenie\s+gospodarcze\b"])
@@ -250,8 +262,10 @@ class ApartmentPlanOCR:
         has_loggia = present([r"\bloggi\w*"])
         has_taras = present([r"\btaras\w*"])
 
-        # Poddasze U/N na podstawie frazy "przestrzeń techniczna"
-        attic_use = "U" if re.search(r"przestrze[nn]\s*techniczna|przestrze\u0144\s*techniczna", text, re.IGNORECASE) else "N"
+        # Poddasze U/N - bazuje na liczbie stron (kondygnacji)
+        # 1-2 strony = tylko parter/piętro = poddasze nieużytkowe (N)
+        # 3+ strony = jest dodatkowe poddasze użytkowe = U
+        attic_use = "U" if page_count >= 3 else "N"
 
         # Liczba łazienek - szukamy WSZYSTKICH tabel w dokumencie (może być wiele stron)
         bathrooms_count = 0
@@ -315,7 +329,7 @@ class ApartmentPlanOCR:
 # --- Interfejs Użytkownika Streamlit ---
 
 st.set_page_config(layout="wide")
-st.title("🤖 OCR do ekstrakcji danych v4.7") # Zwiększona wersja dla przejrzystości
+st.title("🤖 OCR do ekstrakcji danych v4.8") # Zwiększona wersja
 st.subheader("Silnik ekstrakcji: PyMuPDF (metoda 'blocks', logika 'ostatniego dopasowania')")
 st.write("Wgraj jeden lub więcej plików PDF. Numery lokali i budynków będą odczytywane głównie z nazw plików.")
 
