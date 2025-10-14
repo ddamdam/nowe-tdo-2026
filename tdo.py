@@ -14,41 +14,42 @@ class ApartmentPlanOCR:
     def __init__(self):
         # Pełna, zaktualizowana lista kolumn
         self.columns = [
-            "Nazwa pliku", "NR budynku", "NR Lokalu", "Nazwa robocza typu", "Typ",
+            "Nazwa pliku", "NR budynku", "NR Lokalu", "Nazwa robocza typu",
             "Etap realizacyjny", "Strony świata (okna)", "Liczba kondygnacji",
-            "Poddasze Uzytkowe/Nieuzytkowe",
-            "Glowne wejscie do lokalu - kondygnacja",
+            "Poddasze Użytkowe/Nieużytkowe",
+            "Główne wejscie do lokalu - kondygnacja",
             "Numer lokalu z dokumentacji budowlanej",
-            "Powierzchnia z dokumentacji budowlanej dla GW (m2) z garazami",
-            "Powierzchnia z dokumentacji budowlanej dla GW (m2) + pow. schodow",
-            "Powierzchnia uzytkowa parter (m2)",
-            "Powierzchnia uzytkowa pietro (m2)",
-            "Powierzchnia pod sciankami i schodow Parter (m2)",
-            "Powierzchnia pod sciankami i schodow Pietro (m2)",
-            "Laczna powierzchnia lokalu poddasze uzytkowe (m2)",
-            "Powierzchnia lacznie (m2)",
-            "Powierzchnia ogrodek (m2)",
-            "Ilosc pokoi",
-            "Garderoba (0 brak, 1 jest)",
+            "Powierzchnia z dokumentacji budowlanej dla GW (m2) (z garażami)\n*UWAGA: powierzchnia do zweryfikowania po otrzymaniu proj. budowlanego",
+            "Powierzchnia z dokumentacji budowlanej dla GW (m2) + pow. schodów",
+            "Powierzchnia użytkowa parter (m2)",
+            "Powierzchnia użytkowa piętro (m2)",
+            "Powierzchnia pod ściankami i schodów Parter (m2)",
+            "Powierzchnia pod ściankami  i schodów  Piętro  (m2)",
+            "Łączna powierzchnia lokalu poddasze użytkowe (m2)",
+            "Powierzchnia łącznie  (m2)",
+            "Powierzchnia ogródek (m2)",
+            "Ilość pokoi",
+            "Garderoba(0 brak, 1 jest)",
             "Kuchnia (0 brak, 1 jest)",
             "Aneks kuchenny (0 brak, 1 jest)",
             "Okno w kuchni lub aneksie (0 brak, 1 jest)",
             "Schowek (0 brak, 1 jest)",
             "Spiżarnia (0 brak, 1 jest)",
             "Pom. Gosp. (0 brak, 1 jest)",
-            "Lokal połaczony z garażem (0 brak, 1 jest)",
-            "Druga łazienka z prysznicem (0 brak, 1 jest)",
+            "Lokal połączony z garażem (0 brak, 1 jest)",
+            "Ilość łazienek z prysznicem/wanną",
             "Gabinet (0 brak, 1 jest)",
             "Balkon (m2)",
             "Loggia (m2)",
             "Taras (m2)",
-            "Kominek (0 brak, 1 jest)",
             "Oznaczenie miejsca postojowego na terenie/w garażu",
             "Oznaczenie dodatkowego miejsca postojowego",
             "Oznaczenie terenu do wyłącznego korzystania",
-            "Wysokosc parteru (m)",
-            "Wysokosc pietra (m)",
-            "Wysokosc piwnicy (m2)"
+            "Wysokość parteru (m)",
+            "Wysokość piętra (m)",
+            "Piętro 3 (0 brak, 1 jest)",
+            "Wysokość Piętra 3",
+            "Wysokość piwnicy (m2)"
         ]
 
     def extract_text_from_pdf(self, pdf_file_obj: io.BytesIO) -> Tuple[str, int]:
@@ -79,11 +80,41 @@ class ApartmentPlanOCR:
         """Analizuje nazwę pliku, aby wyciągnąć numer budynku i lokalu."""
         try:
             base_name = os.path.splitext(filename)[0]
-            parts = base_name.split('_')
-            if len(parts) > 1:
-                apartment_code = parts[-1]
-                building_num_match = re.search(r'(\d+)', apartment_code)
-                building_num = building_num_match.group(1) if building_num_match else None
+            # Normalizujemy separatory najwyższego poziomu, ale nie polegamy tylko na splitach,
+            # bo kod lokalu może zawierać '-'
+            normalized = base_name.replace('\u2013', '-').replace('\u2014', '-').strip()
+
+            # 1) Wyciągnij kod lokalu w formacie np. "1A", "12B" (cyfry + litera/litery)
+            #    Szukamy ostatniego wystąpienia w całej nazwie, aby obsłużyć różne warianty
+            apt_matches = re.findall(r"\b(\d+\s*[A-Za-z]{1,2})\b", normalized)
+            apartment_code: Optional[str] = None
+            if apt_matches:
+                # Ostatnie dopasowanie zazwyczaj jest właściwym kodem lokalu
+                apartment_code = re.sub(r"\s+", "", apt_matches[-1])
+            else:
+                # Fallback: jeśli są wzorce typu "ZT-1A" albo "ZT_1A", wyciągnij część po '-' lub '_'
+                # i spróbuj ponownie dopasować \d+[A-Za-z]
+                tail = normalized.split('_')[-1]
+                tail = tail.split('-')[-1]
+                m = re.search(r"(\d+\s*[A-Za-z]{1,2})", tail)
+                if m:
+                    apartment_code = re.sub(r"\s+", "", m.group(1))
+
+            # 2) Numer budynku: preferuj pierwszą liczbę w nazwie pliku (np. z "OP6_...")
+            building_num: Optional[str] = None
+            digits_all = re.findall(r"\d+", normalized)
+            if digits_all:
+                # Pierwsza liczba w nazwie to zwykle nr budynku (np. 6 w OP6_ZT-1A)
+                building_num = digits_all[0]
+
+            # Dodatkowa heurystyka: jeżeli znaleziono apartment_code i zawiera cyfry,
+            # ale nie znaleziono building_num (mało prawdopodobne), użyj cyfr z apartment_code
+            if not building_num and apartment_code:
+                m2 = re.match(r"(\d+)", apartment_code)
+                if m2:
+                    building_num = m2.group(1)
+
+            if building_num or apartment_code:
                 return building_num, apartment_code
         except Exception:
             return None, None
@@ -181,41 +212,95 @@ class ApartmentPlanOCR:
         parter_height_cm = ""
         pietro_height_cm = ""
         sections = re.split(r'--- STRONA \d+ ---', text)
+        main_level = ""
         if len(sections) > 1:
-            parter_height_cm = self.extract_height_in_cm(sections[1])
+            page1_text = sections[1]
+            parter_height_cm = self.extract_height_in_cm(page1_text)
+            # Ustal główne wejście na podstawie nagłówków/tekstów strony 1
+            if re.search(r"\bparter\b", page1_text, re.IGNORECASE):
+                main_level = "Parter"
+            elif re.search(r"\bpi[eę]tro\b", page1_text, re.IGNORECASE):
+                main_level = "Piętro"
         if len(sections) > 2:
             pietro_height_cm = self.extract_height_in_cm(sections[2])
+        pietro3_height_cm = ""
+        if len(sections) > 3:
+            pietro3_height_cm = self.extract_height_in_cm(sections[3])
             
         parter_height_m = f"{float(parter_height_cm) / 100:.2f}" if parter_height_cm.isdigit() else ""
         pietro_height_m = f"{float(pietro_height_cm) / 100:.2f}" if pietro_height_cm.isdigit() else ""
+        pietro3_height_m = f"{float(pietro3_height_cm) / 100:.2f}" if pietro3_height_cm.isdigit() else ""
+
+        # Wykrywanie obecności słów kluczowych (0/1)
+        def present(patterns: List[str]) -> str:
+            for p in patterns:
+                if re.search(p, text, re.IGNORECASE):
+                    return "1"
+            return "0"
+
+        has_garderoba = present([r"\bgarderob\w*"])
+        has_kuchnia = present([r"\bkuchni\w*"])
+        has_aneks = present([r"\baneks\w*\s+kuchenn\w*"])
+        has_schowek = present([r"\bschow\w*"])
+        has_spizarnia = present([r"\bspi(?:ż|z)arni\w*"])
+        has_pom_gosp = present([r"\bpom\.?\s*gosp\.?\b", r"\bpomieszczenie\s+gospodarcze\b"])
+        has_gabinet = present([r"\bgabine\w*"])
+        has_kominek = present([r"\bkomine\w*"])
+        # Dodatkowo wykrywamy obecność balkon/loggia/taras (poza metrażem)
+        has_balkon = present([r"\bbalkon\w*"])
+        has_loggia = present([r"\bloggi\w*"])
+        has_taras = present([r"\btaras\w*"])
+
+        # Poddasze U/N na podstawie frazy "przestrzeń techniczna"
+        attic_use = "U" if re.search(r"przestrze[nn]\s*techniczna|przestrze\u0144\s*techniczna", text, re.IGNORECASE) else "N"
+
+        # Liczba łazienek liczona wyłącznie w tabeli pomieszczeń (sekcja od "Pomieszczenie" do "RAZEM")
+        bathrooms_count = 0
+        rooms_match = re.search(r"L\.p\.[\s\S]{0,300}?Pomieszczenie([\s\S]*?)RAZEM", text, re.IGNORECASE)
+        if rooms_match:
+            rooms_block = rooms_match.group(1)
+            bathrooms_count = len(re.findall(r"\b(?:ł|l)azienk\w*", rooms_block, re.IGNORECASE))
+        else:
+            # Fallback gdyby nie znaleziono sekcji tabeli
+            bathrooms_count = len(re.findall(r"\b(?:ł|l)azienk\w*", text, re.IGNORECASE))
+
+        # Ilość pokoi: liczymy tylko w tabeli pomieszczeń wystąpienia: sypialnia, gabinet, pokój/pokoj
+        rooms_count = 0
+        if rooms_match:
+            rooms_block = rooms_match.group(1)
+            rooms_count = len(re.findall(r"\b(sypialn\w*|gabine\w*|pok[oó]j\w*)\b", rooms_block, re.IGNORECASE))
 
         result = {
             "Nazwa pliku": filename, "NR budynku": building_num or "", "NR Lokalu": apartment_code or "",
-            "Nazwa robocza typu": "", "Typ": "", "Etap realizacyjny": "", "Strony świata (okna)": "",
+            "Nazwa robocza typu": "", "Etap realizacyjny": "", "Strony świata (okna)": "",
             "Liczba kondygnacji": str(page_count) if page_count > 0 else "",
-            "Poddasze Uzytkowe/Nieuzytkowe": "",
-            "Glowne wejscie do lokalu - kondygnacja": "Parter" if page_count > 0 else "",
+            "Poddasze Użytkowe/Nieużytkowe": attic_use,
+            "Główne wejscie do lokalu - kondygnacja": main_level if main_level else ("Parter" if page_count > 0 else ""),
             "Numer lokalu z dokumentacji budowlanej": apartment_code or "",
-            "Powierzchnia z dokumentacji budowlanej dla GW (m2) z garazami": "",
-            "Powierzchnia z dokumentacji budowlanej dla GW (m2) + pow. schodow": "",
-            "Powierzchnia uzytkowa parter (m2)": floor_areas.get("parter_uzytkowa", ""),
-            "Powierzchnia uzytkowa pietro (m2)": floor_areas.get("pietro_uzytkowa", ""),
-            "Powierzchnia pod sciankami i schodow Parter (m2)": floor_areas.get("parter_scianki", ""),
-            "Powierzchnia pod sciankami i schodow Pietro (m2)": floor_areas.get("pietro_scianki", ""),
-            "Laczna powierzchnia lokalu poddasze uzytkowe (m2)": "",
-            "Powierzchnia lacznie (m2)": floor_areas.get("laczna", ""),
-            "Powierzchnia ogrodek (m2)": garden_area,
-            "Ilosc pokoi": "", "Garderoba (0 brak, 1 jest)": "", "Kuchnia (0 brak, 1 jest)": "",
-            "Aneks kuchenny (0 brak, 1 jest)": "", "Okno w kuchni lub aneksie (0 brak, 1 jest)": "",
-            "Schowek (0 brak, 1 jest)": "", "Spiżarnia (0 brak, 1 jest)": "", "Pom. Gosp. (0 brak, 1 jest)": "",
-            "Lokal połaczony z garażem (0 brak, 1 jest)": "", "Druga łazienka z prysznicem (0 brak, 1 jest)": "",
-            "Gabinet (0 brak, 1 jest)": "",
-            "Balkon (m2)": balkon_area, "Loggia (m2)": loggia_area, "Taras (m2)": taras_area,
-            "Kominek (0 brak, 1 jest)": "", "Oznaczenie miejsca postojowego na terenie/w garażu": "",
+            "Powierzchnia z dokumentacji budowlanej dla GW (m2) (z garażami)\n*UWAGA: powierzchnia do zweryfikowania po otrzymaniu proj. budowlanego": "",
+            "Powierzchnia z dokumentacji budowlanej dla GW (m2) + pow. schodów": "",
+            "Powierzchnia użytkowa parter (m2)": floor_areas.get("parter_uzytkowa", ""),
+            "Powierzchnia użytkowa piętro (m2)": floor_areas.get("pietro_uzytkowa", ""),
+            "Powierzchnia pod ściankami i schodów Parter (m2)": floor_areas.get("parter_scianki", ""),
+            "Powierzchnia pod ściankami  i schodów  Piętro  (m2)": floor_areas.get("pietro_scianki", ""),
+            "Łączna powierzchnia lokalu poddasze użytkowe (m2)": "",
+            "Powierzchnia łącznie  (m2)": floor_areas.get("laczna", ""),
+            "Powierzchnia ogródek (m2)": garden_area,
+            "Ilość pokoi": str(rooms_count), "Garderoba(0 brak, 1 jest)": has_garderoba, "Kuchnia (0 brak, 1 jest)": has_kuchnia,
+            "Aneks kuchenny (0 brak, 1 jest)": has_aneks, "Okno w kuchni lub aneksie (0 brak, 1 jest)": "",
+            "Schowek (0 brak, 1 jest)": has_schowek, "Spiżarnia (0 brak, 1 jest)": has_spizarnia, "Pom. Gosp. (0 brak, 1 jest)": has_pom_gosp,
+            "Lokal połączony z garażem (0 brak, 1 jest)": "", "Ilość łazienek z prysznicem/wanną": str(bathrooms_count),
+            "Gabinet (0 brak, 1 jest)": has_gabinet,
+            "Balkon (m2)": balkon_area if balkon_area else ("1" if has_balkon == "1" else "0"),
+            "Loggia (m2)": loggia_area if loggia_area else ("1" if has_loggia == "1" else "0"),
+            "Taras (m2)": taras_area if taras_area else ("1" if has_taras == "1" else "0"),
+            "Oznaczenie miejsca postojowego na terenie/w garażu": "",
             "Oznaczenie dodatkowego miejsca postojowego": "", "Oznaczenie terenu do wyłącznego korzystania": "",
-            "Wysokosc parteru (m)": parter_height_m,
-            "Wysokosc pietra (m)": pietro_height_m,
-            "Wysokosc piwnicy (m2)": ""
+            "Wysokość parteru (m)": parter_height_m,
+            "Wysokość piętra (m)": pietro_height_m,
+            "Piętro 3 (0 brak, 1 jest)": "1" if page_count >= 3 else "0",
+            "Wysokość Piętra 3": pietro3_height_m if page_count >= 3 else "",
+            "Wysokość piwnicy (m2)": ""
         }
         return result, text
 
