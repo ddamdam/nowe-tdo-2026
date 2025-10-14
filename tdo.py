@@ -100,17 +100,10 @@ class ApartmentPlanOCR:
                 if m:
                     apartment_code = re.sub(r"\s+", "", m.group(1))
 
-            # 2) Numer budynku: preferuj pierwszą liczbę w nazwie pliku (np. z "OP6_...")
+            # 2) Numer budynku: wyciągnięty z KODU LOKALU (cyfry na początku)
             building_num: Optional[str] = None
-            digits_all = re.findall(r"\d+", normalized)
-            if digits_all:
-                # Pierwsza liczba w nazwie to zwykle nr budynku (np. 6 w OP6_ZT-1A)
-                building_num = digits_all[0]
-
-            # Dodatkowa heurystyka: jeżeli znaleziono apartment_code i zawiera cyfry,
-            # ale nie znaleziono building_num (mało prawdopodobne), użyj cyfr z apartment_code
-            if not building_num and apartment_code:
-                m2 = re.match(r"(\d+)", apartment_code)
+            if apartment_code:
+                m2 = re.match(r"^(\d+)", apartment_code)
                 if m2:
                     building_num = m2.group(1)
 
@@ -131,9 +124,7 @@ class ApartmentPlanOCR:
 
     def extract_building_number_from_text(self, text: str, apartment_code: Optional[str]) -> Optional[str]:
         """Wyodrębnia numer budynku Z TEKSTU."""
-        match = re.search(r'(\d{2})-\d{3}\s+Warszawa', text)
-        if match:
-            return match.group(1)
+        # Wyłącznie z kodu lokalu (np. 1 z 1A); nie używamy kodu pocztowego
         if apartment_code:
             match = re.search(r'^(\d+)', apartment_code)
             if match:
@@ -192,14 +183,22 @@ class ApartmentPlanOCR:
 
 
     def process_pdf(self, pdf_file_obj: io.BytesIO, filename: str) -> Tuple[Dict[str, str], str]:
-        building_num, apartment_code = self.extract_info_from_filename(filename)
+        # Najpierw ekstraktuj tekst z PDF
         text, page_count = self.extract_text_from_pdf(pdf_file_obj)
         if not text:
             return {col: "" for col in self.columns}, ""
-        if not apartment_code:
-            apartment_code = self.extract_apartment_code_from_text(text)
-        if not building_num:
-            building_num = self.extract_building_number_from_text(text, apartment_code)
+
+        # Priorytet: wyciągamy z TEKSTU, a dopiero potem fallback do nazwy pliku
+        apartment_code = self.extract_apartment_code_from_text(text)
+        building_num = self.extract_building_number_from_text(text, apartment_code)
+
+        # Fallback do nazwy pliku, jeśli czegokolwiek brakuje
+        if not apartment_code or not building_num:
+            file_building_num, file_apartment_code = self.extract_info_from_filename(filename)
+            if not apartment_code:
+                apartment_code = file_apartment_code
+            if not building_num:
+                building_num = file_building_num
 
         floor_areas = self.extract_floor_areas(text)
         
@@ -254,21 +253,30 @@ class ApartmentPlanOCR:
         # Poddasze U/N na podstawie frazy "przestrzeń techniczna"
         attic_use = "U" if re.search(r"przestrze[nn]\s*techniczna|przestrze\u0144\s*techniczna", text, re.IGNORECASE) else "N"
 
-        # Liczba łazienek liczona wyłącznie w tabeli pomieszczeń (sekcja od "Pomieszczenie" do "RAZEM")
+        # Liczba łazienek - szukamy WSZYSTKICH tabel w dokumencie (może być wiele stron)
         bathrooms_count = 0
-        rooms_match = re.search(r"L\.p\.[\s\S]{0,300}?Pomieszczenie([\s\S]*?)RAZEM", text, re.IGNORECASE)
-        if rooms_match:
-            rooms_block = rooms_match.group(1)
-            bathrooms_count = len(re.findall(r"\b(?:ł|l)azienk\w*", rooms_block, re.IGNORECASE))
+        rooms_matches = re.findall(r"L\.p\.[\s\S]{0,300}?Pomieszczenie([\s\S]*?)RAZEM", text, re.IGNORECASE)
+        if rooms_matches:
+            for rooms_block in rooms_matches:
+                # Szukamy linii z numeracją typu "0.2", "1.4" itp. + słowo "łazienka"
+                bathroom_lines = re.findall(r"\d+\.\d+\s+(?:ł|l)azienk\w*", rooms_block, re.IGNORECASE)
+                bathrooms_count += len(bathroom_lines)
         else:
-            # Fallback gdyby nie znaleziono sekcji tabeli
-            bathrooms_count = len(re.findall(r"\b(?:ł|l)azienk\w*", text, re.IGNORECASE))
+            # Fallback: szukamy w całym tekście z numeracją
+            bathroom_lines = re.findall(r"\d+\.\d+\s+(?:ł|l)azienk\w*", text, re.IGNORECASE)
+            bathrooms_count = len(bathroom_lines)
 
-        # Ilość pokoi: liczymy tylko w tabeli pomieszczeń wystąpienia: sypialnia, gabinet, pokój/pokoj
+        # Ilość pokoi: salon + gabinet + sypialnie we WSZYSTKICH tabelach
         rooms_count = 0
-        if rooms_match:
-            rooms_block = rooms_match.group(1)
-            rooms_count = len(re.findall(r"\b(sypialn\w*|gabine\w*|pok[oó]j\w*)\b", rooms_block, re.IGNORECASE))
+        if rooms_matches:
+            for rooms_block in rooms_matches:
+                # Szukamy linii z numeracją + słowa: salon, sypialnia, gabinet, pokój
+                room_lines = re.findall(r"\d+\.\d+\s+(?:salon|sypialn\w*|gabine\w*|pok[oó]j\w*)", rooms_block, re.IGNORECASE)
+                rooms_count += len(room_lines)
+        else:
+            # Fallback
+            room_lines = re.findall(r"\d+\.\d+\s+(?:salon|sypialn\w*|gabine\w*|pok[oó]j\w*)", text, re.IGNORECASE)
+            rooms_count = len(room_lines)
 
         result = {
             "Nazwa pliku": filename, "NR budynku": building_num or "", "NR Lokalu": apartment_code or "",
