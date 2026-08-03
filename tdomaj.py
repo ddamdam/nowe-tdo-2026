@@ -36,7 +36,7 @@ EXCEL_COLUMNS: List[Dict] = [
     {"idx": 2, "source": "ocr", "section": "lokalizacja", "header": "NR Lokalu"},
     {"idx": 3, "source": "ocr", "section": "lokalizacja", "header": "Nazwa robocza typu"},
     {"idx": 4, "source": "architekt", "section": "lokalizacja", "header": "Typ"},
-    {"idx": 5, "source": "ocr", "section": "lokalizacja", "header": "Etap"},
+    {"idx": 5, "source": "architekt", "section": "lokalizacja", "header": "Etap"},
     {"idx": 6, "source": "architekt", "section": "lokalizacja", "header": "Strony świata (okna)"},
     {"idx": 7, "source": "ocr", "section": "lokalizacja", "header": "Liczba kondygnacji"},
     {"idx": 8, "source": "ocr", "section": "lokalizacja", "header": "Poddasze Użytkowe/Nieużytkowe"},
@@ -569,18 +569,34 @@ class ApartmentPlanOCR:
         return match.group(1).strip() if match else ""
 
     def extract_info_from_filename(self, filename: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Lokal i budynek z nazwy pliku, np. OF_ZT_7A_typ_s90P → lokal 7A, budynek 7.
+        Część typ_* to nazwa robocza typu, NIE numer lokalu.
+        """
         try:
-            base_name = os.path.splitext(filename)[0]
-            normalized = base_name.replace("\u2013", "-").replace("\u2014", "-").strip()
-            apt_matches = re.findall(r"\b(\d+\s*[A-Za-z]{1,2})\b", normalized)
+            base_name = os.path.splitext(os.path.basename(filename))[0]
+            normalized = (
+                base_name.replace("\u2013", "-").replace("\u2014", "-").strip()
+            )
+            # Odetnij typ_… — inaczej 90P / 60P / 80P mylą się z numerem lokalu
+            without_typ = re.sub(r"[_\-]typ[_\-].*$", "", normalized, flags=re.IGNORECASE)
+
             apartment_code: Optional[str] = None
-            if apt_matches:
-                apartment_code = re.sub(r"\s+", "", apt_matches[-1])
+            # Główny wzorzec: …ZT_7A… / …ZT-10B…
+            match = re.search(
+                r"(?:^|[_-])ZT[_-](\d+[A-Za-z])(?:[_-]|$)",
+                without_typ,
+                re.IGNORECASE,
+            )
+            if match:
+                apartment_code = match.group(1).upper()
             else:
-                tail = normalized.split("_")[-1].split("-")[-1]
-                m = re.search(r"(\d+\s*[A-Za-z]{1,2})", tail)
-                if m:
-                    apartment_code = re.sub(r"\s+", "", m.group(1))
+                # Fallback: ostatni sensowny kod lokalu w części bez typ_
+                apt_matches = re.findall(
+                    r"(?<![A-Za-z])(\d+[A-Za-z])(?![A-Za-z0-9])", without_typ
+                )
+                if apt_matches:
+                    apartment_code = apt_matches[-1].upper()
 
             building_num: Optional[str] = None
             if apartment_code:
@@ -595,19 +611,25 @@ class ApartmentPlanOCR:
         return None, None
 
     def extract_apartment_code_from_text(self, text: str) -> Optional[str]:
-        """Kod lokalu z bloku 'Oznaczenie lokalu:' (np. 1A), nie z adresu biura."""
+        """Kod lokalu z bloku 'Oznaczenie lokalu:' (np. 5A), nie z adresu biura."""
         for block in re.split(r"Oznaczenie lokalu:", text, flags=re.IGNORECASE)[1:]:
-            match = re.search(r"(?<![\w/-])(\d+[A-Z])\s*(?:\n|ok\.)", block, re.IGNORECASE)
+            match = re.search(
+                r"(?<![\w/-])(\d+[A-Z])\s*(?:\n|ok\.|,|\s|$)",
+                block,
+                re.IGNORECASE,
+            )
             if match:
                 return match.group(1).upper()
-        matches = re.findall(r"Oznaczenie lokalu[:\s]+([\w\d/.-]+)", text, re.IGNORECASE)
+        matches = re.findall(
+            r"Oznaczenie lokalu[:\s]+([\w\d/.-]+)", text, re.IGNORECASE
+        )
         for match in matches:
             if re.fullmatch(r"\d+[A-Za-z]", match.strip()):
                 return match.strip().upper()
         return None
 
     def extract_typ_name_from_filename(self, filename: str) -> str:
-        match = re.search(r"typ_([^.]+?)(?:\.pdf)?$", filename, re.IGNORECASE)
+        match = re.search(r"[_\-]typ[_\-]([^.]+?)(?:\.pdf)?$", filename, re.IGNORECASE)
         return match.group(1) if match else ""
 
     def extract_etap_from_text(self, text: str) -> str:
@@ -620,13 +642,11 @@ class ApartmentPlanOCR:
         match = re.search(r"ETAP[_\s-]*(\d+)", filename, re.IGNORECASE)
         return match.group(1) if match else ""
 
-    def extract_kitchen_window(self, has_kuchnia: str, has_aneks: str) -> str:
-        """Osobna kuchnia ma okno (1); aneks kuchenny w próbkach Osiedle Fikus — 0."""
-        if has_kuchnia == "1":
+    def extract_kitchen_window(self, text: str) -> str:
+        """1 tylko gdy w PDF jest osobne oznaczenie OKN; inaczej puste (bez zgadywania)."""
+        if re.search(r"\bOKN\b", text, re.IGNORECASE):
             return "1"
-        if has_aneks == "1":
-            return "0"
-        return "0"
+        return ""
 
     def extract_garage_connected(self, text: str) -> str:
         if re.search(r"\d+\.\d+\s+GARA(?:Ż|Z)\b", text, re.IGNORECASE):
@@ -901,24 +921,21 @@ class ApartmentPlanOCR:
         return "0"
 
     def process_pdf(
-        self, pdf_file_obj: io.BytesIO, filename: str, default_etap: str = ""
+        self, pdf_file_obj: io.BytesIO, filename: str
     ) -> Tuple[Dict[str, str], str]:
         text, page_count = self.extract_text_from_pdf(pdf_file_obj)
         if not text:
             return self.empty_row(), ""
 
-        _, file_apartment = self.extract_info_from_filename(filename)
-        apartment_code = file_apartment or self.extract_apartment_code_from_text(text)
-        building_num = self.extract_building_number_from_text(text, apartment_code)
-        if not building_num:
-            building_num, _ = self.extract_info_from_filename(filename)
+        building_num, file_apartment = self.extract_info_from_filename(filename)
+        text_apartment = self.extract_apartment_code_from_text(text)
+        # Nazwa …ZT_7A_typ_s90P jest wiarygodna; typ_* nie jest numerem lokalu.
+        # Tekst „Oznaczenie lokalu” jako zapas, gdy brak wzorca w nazwie.
+        apartment_code = file_apartment or text_apartment
+        if not building_num and apartment_code:
+            building_num = self.extract_building_number_from_text(text, apartment_code)
 
         typ_name = self.extract_typ_name_from_filename(filename)
-        etap = (
-            self.extract_etap_from_text(text)
-            or self.extract_etap_from_filename(filename)
-            or default_etap
-        )
         garage_connected = self.extract_garage_connected(text)
 
         floor_areas = self.extract_floor_areas(text)
@@ -972,12 +989,11 @@ class ApartmentPlanOCR:
             )
 
         result = self.empty_row()
-        kitchen_window = self.extract_kitchen_window(has_kuchnia, has_aneks)
+        kitchen_window = self.extract_kitchen_window(text)
         ocr_values = {
             "NR budynku": building_num or "",
             "NR Lokalu": apartment_code or "",
             "Nazwa robocza typu": typ_name,
-            "Etap": etap,
             "Liczba kondygnacji": str(page_count) if page_count > 0 else "",
             "Poddasze Użytkowe/Nieużytkowe": "U" if page_count >= 3 else "N",
             "Główne wejscie do lokalu - kondygnacja": main_entrance,
@@ -1022,17 +1038,10 @@ st.set_page_config(layout="wide")
 st.title("OCR do ekstrakcji danych — format Excel ostateczny")
 st.subheader("PyMuPDF + eksport zgodny z szablonem (tylko kolumny OCR)")
 st.write(
-    "Wgraj pliki PDF. Program wypełni kolumny oznaczone jako **ocr** "
-    "(w tym numer lokalu, nazwę typu, etap, okno w kuchni i połączenie z garażem). "
-    "Kolumny **marketing** i pozostałe **architekt** uzupełniacie ręcznie."
+    "Wgraj pliki PDF. Program wypełni kolumny oznaczone jako **ocr**. "
+    "Kolumny **marketing** i **architekt** (m.in. etap, strony świata) uzupełniacie ręcznie. "
+    "Okno w kuchni/aneksie: **1** tylko przy oznaczeniu z „okn” w PDF, inaczej puste."
 )
-
-default_etap_value = st.text_input(
-    "Etap — domyślny, gdy brak w PDF / nazwie pliku",
-    value="1A",
-    help="Np. 1, 10, 1A. Dla Pod Dębem często 1A.",
-)
-default_etap = default_etap_value.strip()
 
 ocr = ApartmentPlanOCR()
 
@@ -1052,9 +1061,7 @@ if uploaded_files:
                 progress_bar.progress(
                     (i + 1) / len(uploaded_files), text=f"Przetwarzanie: {uploaded_file.name}"
                 )
-                result, full_text = ocr.process_pdf(
-                    uploaded_file, uploaded_file.name, default_etap=default_etap
-                )
+                result, full_text = ocr.process_pdf(uploaded_file, uploaded_file.name)
                 all_results.append(result)
 
                 if full_text:
