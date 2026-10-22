@@ -1,4 +1,4 @@
-﻿import streamlit as st
+import streamlit as st
 import pandas as pd
 import io
 import re
@@ -920,116 +920,285 @@ class ApartmentPlanOCR:
             return "1"
         return "0"
 
-    def process_pdf(
-        self, pdf_file_obj: io.BytesIO, filename: str
-    ) -> Tuple[Dict[str, str], str]:
+    @staticmethod
+    def _floor_number(label: str) -> Optional[int]:
+        label = label.strip().lower()
+        if label == "parter":
+            return 0
+        match = re.fullmatch(r"pi[eę]tro(?:\s+(\d+))?", label)
+        return int(match.group(1) or 1) if match else None
+
+    def _page_lines(self, page) -> List[Dict]:
+        """Keep PDF coordinates: reading order alone can join unrelated dimensions."""
+        lines = []
+        for block in page.get_text("dict")["blocks"]:
+            for line in block.get("lines", []):
+                parts = []
+                end_x = None
+                for span in line["spans"]:
+                    value = self._decode_broken_digits(span["text"])
+                    # Known broken Lato mappings in the supplied technical plans.
+                    if span["font"].startswith("Lato"):
+                        value = value.replace("\x06", "B").replace("\x15", "L")
+                    if end_x is not None and span["bbox"][0] - end_x > 1.5:
+                        parts.append(" ")
+                    parts.append(value)
+                    end_x = span["bbox"][2]
+                value = "".join(parts).strip()
+                if value:
+                    lines.append({
+                        "text": value, "bbox": line["bbox"],
+                        "color": line["spans"][0]["color"],
+                        "size": max(s["size"] for s in line["spans"]),
+                    })
+        return lines
+
+    @staticmethod
+    def _value_beside(label: Dict, lines: List[Dict]) -> str:
+        x0, y0, x1, y1 = label["bbox"]
+        center = (y0 + y1) / 2
+        candidates = []
+        for other in lines:
+            a, b, c, d = other["bbox"]
+            if a < x1 - 0.5:
+                continue
+            delta = abs((b + d) / 2 - center)
+            if delta <= max(2.5, (y1 - y0) * 0.45):
+                candidates.append((a - x1, delta, other["text"]))
+        return min(candidates)[2] if candidates else ""
+
+    def _explicit_area(self, value: str) -> str:
+        # Require a unit. This excludes drawing dimensions such as 150 or 25.
+        match = re.fullmatch(
+            r"\s*(?:ok\.?\s*)?(\d+(?:[,.]\d+)?)\s*[ml]\s*[2²]\s*",
+            value, re.IGNORECASE,
+        )
+        return self._fmt_area(float(match.group(1).replace(",", "."))) if match else ""
+
+    def extract_plan_layout(self, pdf_file_obj: io.BytesIO) -> Dict:
+        data = {"fields": {}, "floors": {}, "heights": {}, "rooms": {},
+                "main_floor": None, "warnings": []}
+        page_floors = set()
+        table_floors = {}
+        table_total = 0.0
+        summary_patterns = {
+            "total": r"Powierzchnia\s+Użytkowa\s*\*?",
+            "admin": r"Powierzchnia\s+Użytkowa\s+Administracyjna\s*\*{0,2}",
+            "garden": r"Powierzchnia\s+ogrodu",
+            "balcony": r"Powierzchnia\s+balkonu",
+            "terrace": r"Powierzchnia\s+tarasu",
+            "loggia": r"Powierzchnia\s+loggii",
+        }
+        with fitz.open(stream=pdf_file_obj.getvalue(), filetype="pdf") as doc:
+            for page_index, page in enumerate(doc):
+                lines = self._page_lines(page)
+                header = [s for s in lines if s["bbox"][1] < page.rect.height * 0.18]
+                labels = []
+                for line in header:
+                    label = line["text"]
+                    if re.match(r"Oznaczenie lokalu\s*:", label, re.IGNORECASE):
+                        value = re.sub(r"^Oznaczenie lokalu\s*:\s*", "", label, flags=re.IGNORECASE)
+                        value = value or self._value_beside(line, header)
+                        if re.fullmatch(r"\d+[A-Za-z]", value):
+                            data["fields"]["apartment"] = value.upper()
+                    floor = self._floor_number(label)
+                    if floor is not None:
+                        labels.append((floor, line))
+                        area = self._explicit_area(self._value_beside(line, header))
+                        if area:
+                            data["floors"][floor] = area
+                    for key, pattern in summary_patterns.items():
+                        if re.fullmatch(pattern, label, re.IGNORECASE):
+                            value = self._explicit_area(self._value_beside(line, header))
+                            if value:
+                                previous = data["fields"].get(key)
+                                if previous and previous != value:
+                                    data["warnings"].append("Różne wartości w nagłówkach: " + label)
+                                data["fields"][key] = value
+                    if re.fullmatch(r"Typ\s*:?", label, re.IGNORECASE):
+                        value = self._value_beside(line, header).replace("ĺ", ".")
+                        if re.fullmatch(r"[\w./-]+", value):
+                            data["fields"]["type"] = value
+
+                # In these templates the current floor label is blue; other floors
+                # in the repeated summary are black. A single label is unambiguous.
+                active = [f for f, s in labels if s["color"] not in (0, 0xFFFFFF)]
+                current_floor = active[0] if len(active) == 1 else (
+                    labels[0][0] if len(labels) == 1 else None
+                )
+                if current_floor is not None:
+                    page_floors.add(current_floor)
+                    if data["main_floor"] is None or current_floor < data["main_floor"]:
+                        data["main_floor"] = current_floor
+
+                anchors = [s for s in lines if re.match(r"^L\.?p\.?(?:\s|$)", s["text"], re.IGNORECASE)
+                           and s["bbox"][1] > page.rect.height * 0.45]
+                table_start = min((s["bbox"][1] for s in anchors), default=page.rect.height)
+                rows = []
+                if anchors:
+                    table_text = self._decode_broken_digits(page.get_text(
+                        "text", clip=fitz.Rect(0, table_start - 2, page.rect.width, page.rect.height),
+                        sort=True,
+                    ))
+                    for match in re.finditer(
+                        r"(?m)^\s*([0-3]\.\d{1,2})\s+(.+?)\s+(\d+[,.]\d+)(?=\s|$)", table_text,
+                    ):
+                        idx, name, area = match.groups()
+                        rows.append((idx, name.strip(), float(area.replace(",", "."))))
+                    if current_floor is None and rows:
+                        counts = {}
+                        for idx, _, _ in rows:
+                            f = int(idx.split(".")[0])
+                            counts[f] = counts.get(f, 0) + 1
+                        current_floor = max(counts, key=counts.get)
+                        page_floors.add(current_floor)
+                        if data["main_floor"] is None:
+                            data["main_floor"] = current_floor
+                    for idx, name, area in rows:
+                        # Identity, not area: two bedrooms may have equal areas.
+                        if idx in data["rooms"]:
+                            previous = data["rooms"][idx]
+                            if previous != (name, area):
+                                data["warnings"].append("Powtórzony numer pomieszczenia: " + idx)
+                            continue
+                        data["rooms"][idx] = (name, area)
+                        floor = int(idx.split(".")[0])
+                        table_floors[floor] = table_floors.get(floor, 0.0) + area
+                        table_total += area
+                    # DNW: entrance hall on ground floor and the remaining apartment
+                    # on floor 1 share one sheet. Voids belong to the sheet's floor.
+                    voids = re.findall(r"(?mi)^\s*otw[oó]r\s+w\s+stropie\s+(\d+[,.]\d+)", table_text)
+                    if current_floor is not None:
+                        for raw in voids:
+                            area = float(raw.replace(",", "."))
+                            table_floors[current_floor] = table_floors.get(current_floor, 0.0) + area
+                            table_total += area
+
+                # Ignore section diagrams in the left margin and the room schedule.
+                heights = []
+                for line in lines:
+                    x0, y0, x1, y1 = line["bbox"]
+                    if x0 < page.rect.width * 0.35 or y0 < page.rect.height * 0.18 or y0 >= table_start:
+                        continue
+                    match = re.fullmatch(r"H\s*=\s*(\d+(?:[.,]\d+)?)\s*(cm|m)?", line["text"], re.IGNORECASE)
+                    if match:
+                        value = float(match.group(1).replace(",", "."))
+                        if match.group(2) != "m":
+                            value /= 100
+                        if 1 <= value <= 5:
+                            heights.append((line["size"], value))
+                if heights and current_floor is not None:
+                    largest = max(s for s, _ in heights)
+                    values = {v for s, v in heights if abs(s - largest) < 0.1}
+                    if len(values) == 1:
+                        data["heights"][current_floor] = f"{values.pop():.2f}"
+                    else:
+                        data["warnings"].append("Niejednoznaczna wysokość na stronie " + str(page_index + 1))
+
+        for floor, area in table_floors.items():
+            data["floors"].setdefault(floor, self._fmt_area(area))
+        total = self._to_float(data["fields"].get("total"))
+        if total is not None and data["rooms"] and abs(total - table_total) > 0.06:
+            data["warnings"].append("Suma pomieszczeń nie zgadza się z powierzchnią lokalu — sprawdź podział na kondygnacje.")
+        if total is None and table_floors:
+            data["fields"]["total"] = self._fmt_area(table_total)
+        elif total is not None and data["floors"]:
+            floor_total = sum(float(v) for v in data["floors"].values())
+            if abs(total - floor_total) > 0.06:
+                data["warnings"].append("Suma kondygnacji nie zgadza się z powierzchnią lokalu.")
+        data["floor_count"] = len(set(data["floors"]) | page_floors)
+        return data
+
+    def process_pdf(self, pdf_file_obj: io.BytesIO, filename: str) -> Tuple[Dict[str, str], str]:
+        self.last_warnings = []
         text, page_count = self.extract_text_from_pdf(pdf_file_obj)
         if not text:
+            self.last_warnings = ["Brak czytelnej warstwy tekstowej PDF. Potrzebny jest dokument tekstowy lub osobny OCR skanu."]
             return self.empty_row(), ""
+        layout = self.extract_plan_layout(pdf_file_obj)
+        self.last_warnings.extend(layout["warnings"])
+        building, file_apartment = self.extract_info_from_filename(filename)
+        fields, floors = layout["fields"], layout["floors"]
+        apartment = fields.get("apartment") or file_apartment or self.extract_apartment_code_from_text(text)
+        if fields.get("apartment") and file_apartment and fields["apartment"] != file_apartment:
+            self.last_warnings.append("Numer lokalu w nazwie pliku różni się od nagłówka — użyto numeru z dokumentu.")
+        building = self.extract_building_number_from_text(text, apartment)
+        typ = fields.get("type") or self.extract_typ_name_from_filename(filename)
 
-        building_num, file_apartment = self.extract_info_from_filename(filename)
-        text_apartment = self.extract_apartment_code_from_text(text)
-        # Nazwa …ZT_7A_typ_s90P jest wiarygodna; typ_* nie jest numerem lokalu.
-        # Tekst „Oznaczenie lokalu” jako zapas, gdy brak wzorca w nazwie.
-        apartment_code = file_apartment or text_apartment
-        if not building_num and apartment_code:
-            building_num = self.extract_building_number_from_text(text, apartment_code)
-
-        typ_name = self.extract_typ_name_from_filename(filename)
-        garage_connected = self.extract_garage_connected(text)
-
-        floor_areas = self.extract_floor_areas(text)
-        parter_uzytkowa = floor_areas.get("parter_uzytkowa", "")
-        pietro_uzytkowa = floor_areas.get("pietro_uzytkowa", "")
-        pietro2_uzytkowa = floor_areas.get("pietro2_uzytkowa", "")
-        laczna_uzytkowa = (
-            floor_areas.get("laczna", "")
-            or self._safe_float_sum(parter_uzytkowa, pietro_uzytkowa, pietro2_uzytkowa)
-        )
-        admin_laczna = floor_areas.get("admin_laczna", "")
-
-        garden_area = floor_areas.get("garden") or self.extract_garden_area(text)
-        main_entrance = self.extract_main_entrance(text, page_count)
-
-        sections = re.split(r"--- STRONA \d+ ---", text)
-        parter_height_cm = self.extract_height_in_cm(sections[1]) if len(sections) > 1 else ""
-        pietro_height_cm = self.extract_height_in_cm(sections[2]) if len(sections) > 2 else ""
-
-        def cm_to_m(cm: str) -> str:
-            if not cm.isdigit():
-                return ""
-            value = float(cm) / 100.0
-            text_m = f"{value:.2f}".rstrip("0").rstrip(".")
-            return text_m
-
-        parter_height_m = cm_to_m(parter_height_cm)
-        pietro_height_m = cm_to_m(pietro_height_cm)
+        rooms_count = bathrooms_count = 0
+        has_garderoba = "0"
+        for name, area in layout["rooms"].values():
+            name = name.lower()
+            if re.search(r"łazienk|lazienk", name):
+                bathrooms_count += 1
+            elif "garderob" in name:
+                if area > 5:
+                    rooms_count += 1
+                else:
+                    has_garderoba = "1"
+            elif re.search(r"salon|sypialn|gabine|pok[oó]j", name) and area >= 4:
+                rooms_count += 1
+        if not layout["rooms"]:
+            self.last_warnings.append("Nie odczytano tabeli pomieszczeń — sprawdź liczbę pokoi i pozostałe cechy lokalu.")
 
         def present(patterns: List[str]) -> str:
             return "1" if any(re.search(p, text, re.IGNORECASE) for p in patterns) else "0"
 
-        if bool(re.search(r"\bsalon\s+z\s+(kuchni|aneks)\w*", text, re.IGNORECASE)):
-            has_kuchnia, has_aneks = "0", "1"
+        has_aneks = present([r"\bsalon\s+z\s+(?:kuchni|aneks)\w*", r"\baneks\w*\s+kuchenn\w*"])
+        has_kuchnia = "0" if has_aneks == "1" else present([r"\bkuchni\w*"])
+        # A page count cannot establish whether the attic is usable.
+        attic = ""
+        if re.search(r"poddasze\s+nieużytkowe|przestrzeń\s+techniczna", text, re.IGNORECASE):
+            attic = "N"
+        elif re.search(r"poddasze\s+użytkowe", text, re.IGNORECASE):
+            attic = "U"
         else:
-            has_aneks = present([r"\baneks\w*\s+kuchenn\w*"])
-            has_kuchnia = "0" if has_aneks == "1" else present([r"\bkuchni\w*"])
+            self.last_warnings.append("Rodzaj poddasza wymaga potwierdzenia — brak jednoznacznego oznaczenia tekstowego.")
 
-        rooms_count, has_garderoba, bathrooms_count = self.count_rooms_and_garderoba(text)
-        if rooms_count == 0:
-            rooms_count = len(
-                re.findall(
-                    r"\d+\.\d+\s+(?:salon|sypialn\w*|gabine\w*|pok[oó]j\w*)",
-                    text,
-                    re.IGNORECASE,
-                )
-            )
-        if bathrooms_count == 0:
-            bathrooms_count = len(
-                re.findall(r"\d+\.\d+\s+(?:ł|l)azienk\w*", text, re.IGNORECASE)
-            )
-
+        floor_names = {0: "parter", 1: "piętro", 2: "piętro 2"}
         result = self.empty_row()
-        kitchen_window = self.extract_kitchen_window(text)
-        ocr_values = {
-            "NR budynku": building_num or "",
-            "NR Lokalu": apartment_code or "",
-            "Nazwa robocza typu": typ_name,
-            "Liczba kondygnacji": str(page_count) if page_count > 0 else "",
-            "Poddasze Użytkowe/Nieużytkowe": "U" if page_count >= 3 else "N",
-            "Główne wejscie do lokalu - kondygnacja": main_entrance,
-            "Numer lokalu z dokumentacji budowlanej": apartment_code or "",
-            "Powierzchnia użytkowa adm. suma (m2)": admin_laczna,
-            "Powierzchnia użytkowa parter (m2)": parter_uzytkowa,
-            "Powierzchnia użytkowa piętro (m2)": pietro_uzytkowa,
-            "Powierzchnia użytkowa piętro 2 (m2)": (
-                pietro2_uzytkowa if page_count >= 3 else "0.00" if page_count > 0 else ""
-            ),
-            "Powierzchnia użytkowa suma (m2)": laczna_uzytkowa,
-            "Powierzchnia ogródek (m2)": garden_area,
-            "Ilość pokoi": str(rooms_count) if rooms_count > 0 else "",
-            "Garderoba(0 brak, 1 jest)": has_garderoba,
+        result.update({
+            "NR budynku": building or "",
+            "NR Lokalu": apartment or "",
+            "Numer lokalu z dokumentacji budowlanej": apartment or "",
+            "Nazwa robocza typu": typ or "",
+            "Liczba kondygnacji": str(layout["floor_count"]) if layout["floor_count"] else "",
+            "Poddasze Użytkowe/Nieużytkowe": attic,
+            "Główne wejscie do lokalu - kondygnacja": floor_names.get(layout["main_floor"], ""),
+            "Powierzchnia użytkowa adm. suma (m2)": fields.get("admin", ""),
+            "Powierzchnia użytkowa parter (m2)": floors.get(0, ""),
+            "Powierzchnia użytkowa piętro (m2)": floors.get(1, ""),
+            "Powierzchnia użytkowa piętro 2 (m2)": floors.get(2, ""),
+            "Powierzchnia użytkowa suma (m2)": fields.get("total", ""),
+            "Powierzchnia ogródek (m2)": fields.get("garden", ""),
+            "Ilość pokoi": str(rooms_count) if layout["rooms"] else "",
+            "Garderoba(0 brak, 1 jest)": has_garderoba if layout["rooms"] else "",
             "Kuchnia (0 brak, 1 jest)": has_kuchnia,
             "Aneks kuchenny (0 brak, 1 jest)": has_aneks,
-            "Okno w kuchni lub aneksie (0 brak, 1 jest)": kitchen_window,
+            "Okno w kuchni lub aneksie (0 brak, 1 jest)": self.extract_kitchen_window(text),
             "Schowek (0 brak, 1 jest)": present([r"\bschow\w*"]),
             "Spiżarnia (0 brak, 1 jest)": present([r"\bspi(?:ż|z)arni\w*"]),
-            "Pom. Gosp. (0 brak, 1 jest)": present(
-                [r"\bpom\.?\s*gosp\.?\b", r"\bpomieszczenie\s+gospodarcze\b"]
-            ),
-            "Lokal połączony z garażem (0 brak, 1 jest)": garage_connected,
-            "Druga łazienka z prysznicem (0 brak, 1 jest)": (
-                "1" if bathrooms_count >= 2 else "0"
-            ),
+            "Pom. Gosp. (0 brak, 1 jest)": present([r"\bpom\.?\s*gosp\.?\b", r"\bpomieszczenie\s+gospodarcze\b"]),
+            "Lokal połączony z garażem (0 brak, 1 jest)": self.extract_garage_connected(text),
+            "Druga łazienka z prysznicem (0 brak, 1 jest)": ("1" if bathrooms_count >= 2 else "0") if layout["rooms"] else "",
             "Gabinet (0 brak, 1 jest)": present([r"\bgabine\w*"]),
-            "Balkon (m2)": self.extract_outdoor_area_m2(text, "balkon"),
-            "Loggia (m2)": self.extract_outdoor_area_m2(text, "loggi"),
-            "Taras (m2)": self.extract_outdoor_area_m2(text, "taras"),
-            "Wysokość parteru (m)": parter_height_m,
-            "Wysokość piętra (m)": pietro_height_m,
-            "Wysokość piwnicy (m2)": "0",
-        }
-        result.update(ocr_values)
+            "Balkon (m2)": fields.get("balcony", "" if re.search(r"\bbalkon", text, re.IGNORECASE) else "0"),
+            "Loggia (m2)": fields.get("loggia", "" if re.search(r"\bloggi", text, re.IGNORECASE) else "0"),
+            "Taras (m2)": fields.get("terrace", "" if re.search(r"\btaras", text, re.IGNORECASE) else "0"),
+            "Wysokość parteru (m)": layout["heights"].get(0, ""),
+            "Wysokość piętra (m)": layout["heights"].get(1, ""),
+            "Wysokość piwnicy (m2)": "",
+        })
+        for key, description in [("total", "powierzchnia użytkowa"), ("admin", "powierzchnia administracyjna")]:
+            if not fields.get(key):
+                self.last_warnings.append("Nie odczytano pola: " + description)
+        if not typ:
+            self.last_warnings.append("Nie odczytano nazwy roboczej typu.")
+        for floor in floors:
+            if floor in (0, 1) and floor not in layout["heights"]:
+                self.last_warnings.append("Wysokość kondygnacji " + floor_names[floor] + " wymaga ręcznego sprawdzenia.")
         return result, text
+
 
 
 # --- Interfejs Użytkownika Streamlit ---
@@ -1063,6 +1232,8 @@ if uploaded_files:
                 )
                 result, full_text = ocr.process_pdf(uploaded_file, uploaded_file.name)
                 all_results.append(result)
+                for warning in ocr.last_warnings:
+                    st.warning(f"{uploaded_file.name}: {warning}")
 
                 if full_text:
                     with st.expander(f"Pokaż/Ukryj pełny tekst odczytany z '{uploaded_file.name}'"):
@@ -1105,3 +1276,4 @@ if "df_results" in st.session_state:
         file_name="wyniki_ocr.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheet.sheet",
     )
+
