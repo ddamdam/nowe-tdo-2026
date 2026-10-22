@@ -35,7 +35,7 @@ EXCEL_COLUMNS: List[Dict] = [
     {"idx": 1, "source": "ocr", "section": "lokalizacja", "header": "NR budynku"},
     {"idx": 2, "source": "ocr", "section": "lokalizacja", "header": "NR Lokalu"},
     {"idx": 3, "source": "ocr", "section": "lokalizacja", "header": "Nazwa robocza typu"},
-    {"idx": 4, "source": "architekt", "section": "lokalizacja", "header": "Typ"},
+    {"idx": 4, "source": "architekt", "section": "lokalizacja", "header": "typ zabudowy"},
     {"idx": 5, "source": "architekt", "section": "lokalizacja", "header": "Etap"},
     {"idx": 6, "source": "architekt", "section": "lokalizacja", "header": "Strony świata (okna)"},
     {"idx": 7, "source": "ocr", "section": "lokalizacja", "header": "Liczba kondygnacji"},
