@@ -36,8 +36,8 @@ EXCEL_COLUMNS: List[Dict] = [
     {"idx": 2, "source": "ocr", "section": "lokalizacja", "header": "NR Lokalu"},
     {"idx": 3, "source": "ocr", "section": "lokalizacja", "header": "Nazwa robocza typu"},
     {"idx": 4, "source": "architekt", "section": "lokalizacja", "header": "typ zabudowy"},
-    {"idx": 5, "source": "architekt", "section": "lokalizacja", "header": "Etap"},
-    {"idx": 6, "source": "architekt", "section": "lokalizacja", "header": "Strony świata (okna)"},
+    {"idx": 5, "source": "ocr", "section": "lokalizacja", "header": "Etap"},
+    {"idx": 6, "source": "ocr", "section": "lokalizacja", "header": "Strony świata (okna)"},
     {"idx": 7, "source": "ocr", "section": "lokalizacja", "header": "Liczba kondygnacji"},
     {"idx": 8, "source": "ocr", "section": "lokalizacja", "header": "Poddasze Użytkowe/Nieużytkowe"},
     {"idx": 9, "source": "ocr", "section": "lokalizacja", "header": "Główne wejscie do lokalu - kondygnacja"},
@@ -47,7 +47,7 @@ EXCEL_COLUMNS: List[Dict] = [
     # --- BILANS ZGODNIE Z ROZPORZĄDZENIEM ---
     {"idx": 12, "source": "architekt", "section": "rozporzadzenie", "header": "Powierzchnia użytkowa adm. parter (m2)"},
     {"idx": 13, "source": "architekt", "section": "rozporzadzenie", "header": "Powierzchnia użytkowa adm. piętro (m2)"},
-    {"idx": 14, "source": "architekt", "section": "rozporzadzenie", "header": "Łączna powierzchnia lokalu piętro 2 użytkowe (m2)"},
+    {"idx": 14, "source": "architekt", "section": "rozporzadzenie", "header": "Powierzchnia użytkowa adm. piętro 2 (m2)"},
     {"idx": 15, "source": "ocr", "section": "rozporzadzenie", "header": "Powierzchnia użytkowa adm. suma (m2)"},
     {"idx": 16, "source": "architekt", "section": "rozporzadzenie", "header": "Powierzchnia łącznie  (m2)"},
     # --- BILANS ZGODNIE Z USTAWĄ ---
@@ -76,10 +76,10 @@ EXCEL_COLUMNS: List[Dict] = [
     {"idx": 38, "source": "marketing", "section": "zalaczniki", "header": "Oznaczenie terenu do wyłącznego korzystania"},
     {"idx": 39, "source": "ocr", "section": "zalaczniki", "header": "Wysokość parteru (m)"},
     {"idx": 40, "source": "ocr", "section": "zalaczniki", "header": "Wysokość piętra (m)"},
-    {"idx": 41, "source": "ocr", "section": "zalaczniki", "header": "Wysokość piwnicy (m2)"},
+    {"idx": 41, "source": "ocr", "section": "zalaczniki", "header": "Wysokość piętra 2 (m)"},
     # --- MARKETING (na końcu) ---
-    {"idx": 42, "source": "marketing", "section": "marketing", "header": "OSIEDLE"},
-    {"idx": 43, "source": "marketing", "section": "marketing", "header": "Miasto/Miejscowość"},
+    {"idx": 42, "source": "ocr", "section": "marketing", "header": "OSIEDLE"},
+    {"idx": 43, "source": "ocr", "section": "marketing", "header": "Miasto/Miejscowość"},
     {"idx": 44, "source": "marketing", "section": "marketing", "header": "Dzielnica"},
     {"idx": 45, "source": "marketing", "section": "marketing", "header": "OPIS LOKALU"},
     {"idx": 46, "source": "marketing", "section": "marketing", "header": "URL"},
@@ -977,7 +977,8 @@ class ApartmentPlanOCR:
 
     def extract_plan_layout(self, pdf_file_obj: io.BytesIO) -> Dict:
         data = {"fields": {}, "floors": {}, "heights": {}, "rooms": {},
-                "main_floor": None, "warnings": []}
+                "main_floor": None, "warnings": [], "attic_labels": set()}
+        metadata = {key: set() for key in ("stage", "windows", "estate", "town")}
         page_floors = set()
         table_floors = {}
         table_total = 0.0
@@ -993,6 +994,45 @@ class ApartmentPlanOCR:
             for page_index, page in enumerate(doc):
                 lines = self._page_lines(page)
                 header = [s for s in lines if s["bbox"][1] < page.rect.height * 0.18]
+                # Join only neighbouring lines at the same horizontal position.
+                # Sorted page text interleaves the section caption with plan dimensions.
+                for line in lines:
+                    caption = line["text"]
+                    if re.fullmatch(r"przestrze[ńn]|poddasze", caption, re.IGNORECASE):
+                        x0, y0, x1, y1 = line["bbox"]
+                        below = [s for s in lines if abs(s["bbox"][0] - x0) < 12
+                                 and 2 <= s["bbox"][1] - y0 <= (y1 - y0) * 1.8]
+                        caption += " " + " ".join(s["text"] for s in below)
+                    if re.search(r"\bpoddasze\s+nieu[żz]ytkowe\b|\bprzestrze[ńn]\s+techniczna\b", caption, re.IGNORECASE):
+                        data["attic_labels"].add("N")
+                    if re.search(r"\bpoddasze\s+u[żz]ytkowe\b", caption, re.IGNORECASE):
+                        data["attic_labels"].add("U")
+                # Use apartment sheets, not the legend or the developer's office address.
+                is_plan = any(re.match(r"Oznaczenie lokalu\s*:", s["text"], re.IGNORECASE) for s in header)
+                if is_plan:
+                    for line in header:
+                        label = line["text"]
+                        if re.fullmatch(r"Etap\s*:?", label, re.IGNORECASE):
+                            value = self._value_beside(line, header).strip()
+                            if re.fullmatch(r"(?:\d+[A-Za-z]?|[IVX]+)", value):
+                                metadata["stage"].add(value)
+                        elif re.fullmatch(r"Okna\s*:?", label, re.IGNORECASE):
+                            value = self._value_beside(line, header).strip().upper()
+                            if re.fullmatch(r"[NSEW]+(?:[\s,;/\-]+[NSEW]+)*", value):
+                                metadata["windows"].add(value)
+                        elif re.match(r"Inwestycja\s*:", label, re.IGNORECASE):
+                            estate = re.sub(r"^Inwestycja\s*:\s*", "", label, flags=re.IGNORECASE).strip()
+                            if estate:
+                                metadata["estate"].add(estate)
+                            x0, y0, x1, y1 = line["bbox"]
+                            following = [s for s in header if abs(s["bbox"][0] - x0) < 6
+                                         and 2 <= s["bbox"][1] - y0 <= (y1 - y0) * 1.5
+                                         and not re.match(r"Oznaczenie|Powierzchnia|Parter|Piętro", s["text"], re.IGNORECASE)]
+                            if len(following) == 1:
+                                town = re.sub(r"^Lokalizacja\s*:\s*", "", following[0]["text"], flags=re.IGNORECASE)
+                                town = re.split(r",?\s+ul\.", town, maxsplit=1, flags=re.IGNORECASE)[0].strip(' ,')
+                                if town:
+                                    metadata["town"].add(town)
                 labels = []
                 for line in header:
                     label = line["text"]
@@ -1107,6 +1147,12 @@ class ApartmentPlanOCR:
             if abs(total - floor_total) > 0.06:
                 data["warnings"].append("Suma kondygnacji nie zgadza się z powierzchnią lokalu.")
         data["floor_count"] = len(set(data["floors"]) | page_floors)
+        for key, values in metadata.items():
+            if len(values) == 1:
+                data["fields"][key] = next(iter(values))
+            elif len(values) > 1:
+                names = {"stage": "Etap", "windows": "Okna", "estate": "Inwestycja", "town": "Miejscowość"}
+                data["warnings"].append("Sprzeczne wartości pola " + names[key] + " na stronach PDF — uzupełnij ręcznie.")
         return data
 
     def process_pdf(self, pdf_file_obj: io.BytesIO, filename: str) -> Tuple[Dict[str, str], str]:
@@ -1148,10 +1194,10 @@ class ApartmentPlanOCR:
         has_kuchnia = "0" if has_aneks == "1" else present([r"\bkuchni\w*"])
         # A page count cannot establish whether the attic is usable.
         attic = ""
-        if re.search(r"poddasze\s+nieużytkowe|przestrzeń\s+techniczna", text, re.IGNORECASE):
-            attic = "N"
-        elif re.search(r"poddasze\s+użytkowe", text, re.IGNORECASE):
-            attic = "U"
+        if len(layout["attic_labels"]) == 1:
+            attic = next(iter(layout["attic_labels"]))
+        elif len(layout["attic_labels"]) > 1:
+            self.last_warnings.append("Sprzeczne oznaczenia poddasza użytkowego i nieużytkowego — potwierdź ręcznie.")
         else:
             self.last_warnings.append("Rodzaj poddasza wymaga potwierdzenia — brak jednoznacznego oznaczenia tekstowego.")
 
@@ -1162,6 +1208,10 @@ class ApartmentPlanOCR:
             "NR Lokalu": apartment or "",
             "Numer lokalu z dokumentacji budowlanej": apartment or "",
             "Nazwa robocza typu": typ or "",
+            "Etap": fields.get("stage", ""),
+            "Strony świata (okna)": fields.get("windows", ""),
+            "OSIEDLE": fields.get("estate", ""),
+            "Miasto/Miejscowość": fields.get("town", ""),
             "Liczba kondygnacji": str(layout["floor_count"]) if layout["floor_count"] else "",
             "Poddasze Użytkowe/Nieużytkowe": attic,
             "Główne wejscie do lokalu - kondygnacja": floor_names.get(layout["main_floor"], ""),
@@ -1187,7 +1237,7 @@ class ApartmentPlanOCR:
             "Taras (m2)": fields.get("terrace", "" if re.search(r"\btaras", text, re.IGNORECASE) else "0"),
             "Wysokość parteru (m)": layout["heights"].get(0, ""),
             "Wysokość piętra (m)": layout["heights"].get(1, ""),
-            "Wysokość piwnicy (m2)": "",
+            "Wysokość piętra 2 (m)": layout["heights"].get(2, ""),
         })
         for key, description in [("total", "powierzchnia użytkowa"), ("admin", "powierzchnia administracyjna")]:
             if not fields.get(key):
@@ -1195,7 +1245,7 @@ class ApartmentPlanOCR:
         if not typ:
             self.last_warnings.append("Nie odczytano nazwy roboczej typu.")
         for floor in floors:
-            if floor in (0, 1) and floor not in layout["heights"]:
+            if floor in (0, 1, 2) and floor not in layout["heights"]:
                 self.last_warnings.append("Wysokość kondygnacji " + floor_names[floor] + " wymaga ręcznego sprawdzenia.")
         return result, text
 
@@ -1205,12 +1255,19 @@ class ApartmentPlanOCR:
 
 st.set_page_config(layout="wide")
 st.title("OCR do ekstrakcji danych — format Excel ostateczny")
-st.subheader("PyMuPDF + eksport zgodny z szablonem (tylko kolumny OCR)")
+st.caption("Wersja 2026-11-16 — poprawki po testach Kingi")
 st.write(
     "Wgraj pliki PDF. Program wypełni kolumny oznaczone jako **ocr**. "
-    "Kolumny **marketing** i **architekt** (m.in. etap, strony świata) uzupełniacie ręcznie. "
+    "Etap, strony świata, osiedle i miejscowość odczytuje z nagłówka PDF. "
+    "Pozostałe kolumny **marketing** i **architekt** uzupełniacie ręcznie. "
     "Okno w kuchni/aneksie: **1** tylko przy oznaczeniu z „okn” w PDF, inaczej puste."
 )
+with st.expander("Zasady przygotowania danych"):
+    st.write('Pomieszczenie z samą toaletą nazywaj w PDF „WC”, a nie „łazienka”. '
+             'Program zlicza nazwy łazienek, ale nie rozpoznaje wyposażenia ani prysznica.')
+    st.write('„Powierzchnia łącznie (m2)” w bilansie wg rozporządzenia: '
+             'powierzchnia użytkowa administracyjna + powierzchnia pod schodami (dla GW). '
+             'Pole pozostaje do ręcznego uzupełnienia.')
 
 ocr = ApartmentPlanOCR()
 
@@ -1276,4 +1333,5 @@ if "df_results" in st.session_state:
         file_name="wyniki_ocr.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheet.sheet",
     )
+
 
